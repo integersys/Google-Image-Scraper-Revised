@@ -15,7 +15,7 @@ from selenium.common.exceptions import NoSuchElementException
 #import helper libraries
 import time
 import urllib.request
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus
 import os
 import requests
 import io
@@ -47,8 +47,14 @@ class GoogleImageScraper():
                 #try going to www.google.com
                 options = Options()
                 if(headless):
-                    options.add_argument('--headless')
+                    options.add_argument('--headless=new')
+                options.add_argument('--disable-blink-features=AutomationControlled')
+                options.add_experimental_option('excludeSwitches', ['enable-automation', 'enable-logging'])
+                options.add_experimental_option('useAutomationExtension', False)
                 driver = webdriver.Chrome(webdriver_path, chrome_options=options)
+                driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+                    'source': "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+                })
                 driver.set_window_size(1400,1050)
                 driver.get("https://www.google.com")
                 try:
@@ -57,7 +63,7 @@ class GoogleImageScraper():
                     continue
             except Exception as e:
                 #update chromedriver
-                pattern = '(\d+\.\d+\.\d+\.\d+)'
+                pattern = r'(\d+\.\d+\.\d+\.\d+)'
                 version = list(set(re.findall(pattern, str(e))))[0]
                 is_patched = patch.download_lastest_chromedriver(version)
                 if (not is_patched):
@@ -68,7 +74,7 @@ class GoogleImageScraper():
         self.number_of_images = number_of_images
         self.webdriver_path = webdriver_path
         self.image_path = image_path
-        self.url = "https://www.google.com/search?q=%s&source=lnms&tbm=isch&sa=X&ved=2ahUKEwie44_AnqLpAhUhBWMBHUFGD90Q_AUoAXoECBUQAw&biw=1920&bih=947"%(search_key)
+        self.url = f"https://www.google.com/search?q={quote_plus(search_key)}&udm=2&hl=en"
         self.headless=headless
         self.min_resolution = min_resolution
         self.max_resolution = max_resolution
@@ -84,74 +90,81 @@ class GoogleImageScraper():
         """
         print("[INFO] Gathering image links")
         self.driver.get(self.url)
-        image_urls=[]
-        count = 0
-        missed_count = 0
-        indx_1 = 0
-        indx_2 = 0
-        search_string = '//*[@id="rso"]/div/div/div[1]/div/div/div[%s]/div[2]/h3/a/div/div/div/g-img'
-        time.sleep(3)
-        while self.number_of_images > count and missed_count < self.max_missed:
-            if indx_2 > 0:
-                try:
-                    imgurl = self.driver.find_element(By.XPATH, search_string%(indx_1,indx_2+1))
-                    imgurl.click()
-                    indx_2 = indx_2 + 1
-                    missed_count = 0
-                except Exception:
-                    try:
-                        imgurl = self.driver.find_element(By.XPATH, search_string%(indx_1+1,1))
-                        imgurl.click()
-                        indx_2 = 1
-                        indx_1 = indx_1 + 1
-                    except:
-                        indx_2 = indx_2 + 1
-                        missed_count = missed_count + 1
-            else:
-                try:
-                    imgurl = self.driver.find_element(By.XPATH, search_string%(indx_1+1))
-                    imgurl.click()
-                    missed_count = 0
-                    indx_1 = indx_1 + 1    
-                except Exception:
-                    try:
-                        imgurl = self.driver.find_element(By.XPATH, search_string%(indx_1,indx_2+1))
-                        imgurl.click()
-                        missed_count = 0
-                        indx_2 = indx_2 + 1
-                    except Exception:
-                        indx_1 = indx_1 + 1
-                        missed_count = missed_count + 1
-                    
+        if "/sorry/" in self.driver.current_url:
+            if self.headless:
+                print("[ERROR] Google requested browser verification. Set headless to False and run again.")
+                self.driver.quit()
+                return []
+            print("[INFO] Google requested verification. Complete the check in Chrome to continue.")
             try:
-                #select image from the popup
+                WebDriverWait(self.driver, 180).until(lambda driver: "/sorry/" not in driver.current_url)
+            except Exception:
+                print("[ERROR] Google verification was not completed within three minutes.")
+                self.driver.quit()
+                return []
+        for button_id in ("W0wltc", "L2AGLb"):
+            buttons = self.driver.find_elements(By.ID, button_id)
+            if buttons and buttons[0].is_displayed():
+                buttons[0].click()
+                time.sleep(2)
+                break
+        try:
+            WebDriverWait(self.driver, 15).until(
+                lambda driver: len(driver.find_elements(By.CSS_SELECTOR, "div[data-docid]")) > 0
+            )
+        except Exception:
+            print("[ERROR] Google image results did not load.")
+            self.driver.quit()
+            return []
+        image_urls = []
+        seen_result_ids = set()
+        missed_count = 0
+        time.sleep(3)
+
+        def find_preview_source(driver):
+            for image in driver.find_elements(By.CSS_SELECTOR, "img.iPVvYb"):
+                source = image.get_attribute("src") or ""
+                if source.startswith("http") and "encrypted" not in source and source not in image_urls:
+                    return source
+            return False
+
+        while len(image_urls) < self.number_of_images and missed_count < self.max_missed:
+            results = self.driver.find_elements(By.CSS_SELECTOR, "div[data-docid]")
+            result = None
+            result_id = None
+
+            for candidate in results:
+                candidate_id = candidate.get_attribute("data-docid")
+                if candidate_id and candidate_id not in seen_result_ids:
+                    result = candidate
+                    result_id = candidate_id
+                    break
+
+            if result is None:
+                previous_result_count = len(results)
+                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(2)
+                current_result_count = len(self.driver.find_elements(By.CSS_SELECTOR, "div[data-docid]"))
+                if current_result_count <= previous_result_count:
+                    missed_count += 1
+                continue
+
+            seen_result_ids.add(result_id)
+
+            try:
+                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", result)
+                try:
+                    result.click()
+                except Exception:
+                    self.driver.execute_script("arguments[0].click();", result)
+                source = WebDriverWait(self.driver, 5).until(find_preview_source)
+                image_urls.append(source)
+                print(f"[INFO] {self.search_key} \t #{len(image_urls) - 1} \t {source}")
+                missed_count = 0
                 time.sleep(1)
-                class_names = ["n3VNCb","iPVvYb","r48jcc","pT0Scc","H8Rx8c"]
-                images = [self.driver.find_elements(By.CLASS_NAME, class_name) for class_name in class_names if len(self.driver.find_elements(By.CLASS_NAME, class_name)) != 0 ][0]
-                for image in images:
-                    #only download images that starts with http
-                    src_link = image.get_attribute("src")
-                    if(("http" in src_link) and (not "encrypted" in src_link)):
-                        print(
-                            f"[INFO] {self.search_key} \t #{count} \t {src_link}")
-                        image_urls.append(src_link)
-                        count +=1
-                        break
             except Exception:
                 print("[INFO] Unable to get link")
-
-            try:
-                #scroll page to load next image
-                if(count%3==0):
-                    self.driver.execute_script("window.scrollTo(0, "+str(indx_1*60)+");")
-                element = self.driver.find_element(By.CLASS_NAME,"mye4qd")
-                element.click()
-                print("[INFO] Loading next page")
-                time.sleep(3)
-            except Exception:
-                time.sleep(1)
-
-
+                missed_count += 1
 
         self.driver.quit()
         print("[INFO] Google search ended")
